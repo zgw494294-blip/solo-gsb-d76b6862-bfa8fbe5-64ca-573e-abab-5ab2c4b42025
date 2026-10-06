@@ -1,4 +1,5 @@
-"""FastAPI 入口：提供裁决 API、设备日志合并预览 API、成绩公告 API 与静态页面。"""
+"""FastAPI 入口：提供裁决 API、设备日志合并预览 API、成绩公告 API（含版本链
+导出 / 导入迁移）与静态页面。"""
 
 from __future__ import annotations
 
@@ -15,12 +16,16 @@ from .adjudication import AdjudicationError, adjudicate, diagnose, find_missing
 from .bulletin import (
     BulletinConflict,
     BulletinError,
+    BulletinFork,
+    BulletinNotFound,
     BulletinStore,
+    export_bulletins,
+    import_bulletins,
     publish_bulletin,
 )
 from .merge import MergeError, preview_merge
 
-app = FastAPI(title="本地赛道计次裁决台", version="1.4.0")
+app = FastAPI(title="本地赛道计次裁决台", version="1.5.0")
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 
@@ -202,6 +207,62 @@ async def api_bulletin_read(number: str, version: str | None = None) -> JSONResp
             status_code=404, content={"ok": False, "error": "公告不存在"}
         )
     return JSONResponse(content={"ok": True, "result": bulletin})
+
+
+@app.post("/api/bulletins/export")
+async def api_bulletin_export(request: Request) -> JSONResponse:
+    """导出所选编号的完整版本链（格式版本 1 的 JSON 归档），用于迁移到另一实例。
+
+    归档含每版编号、版本、发布时间与完整快照；整包取自同一数据库时点。
+    任一编号未知整次 404，不出部分归档。只读，不改动任何公告。
+    """
+    try:
+        payload = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return JSONResponse(
+            status_code=400, content={"ok": False, "error": "请求体不是合法的 JSON"}
+        )
+    try:
+        archive = export_bulletins(payload, get_bulletin_store())
+    except BulletinNotFound as exc:
+        return JSONResponse(status_code=404, content={"ok": False, "error": str(exc)})
+    except BulletinError as exc:
+        return JSONResponse(status_code=422, content={"ok": False, "error": str(exc)})
+    return JSONResponse(content={"ok": True, "result": archive})
+
+
+@app.post("/api/bulletins/import")
+async def api_bulletin_import(request: Request) -> JSONResponse:
+    """导入格式版本 1 的归档：把版本链并入本地，不重新裁决、不覆盖本地历史。
+
+    每个编号的版本须从 1 起连续且无重复，快照结构与原读取结果一致；重叠版本
+    的快照及发布时间须相同（对象键序忽略，数组顺序与 JSON 类型保留），相同项
+    跳过、只追加缺失后缀，本地链更长则保留本地。任一编号分叉整次 409、格式
+    非法整次 422，两者都不写入任何编号；成功返回新增与跳过数。核对与写入在
+    同一事务中按提交时库内状态进行，与既有发布协调，不留断链或半批。
+    """
+    try:
+        payload = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return JSONResponse(
+            status_code=400, content={"ok": False, "error": "请求体不是合法的 JSON"}
+        )
+    try:
+        result = import_bulletins(payload, get_bulletin_store())
+    except BulletinFork as exc:
+        # 任一编号分叉：整次不写入任何编号，本地历史保持原样。
+        return JSONResponse(
+            status_code=409,
+            content={
+                "ok": False,
+                "error": f"{exc}，整次导入未写入任何公告",
+                "number": exc.number,
+                "version": exc.version,
+            },
+        )
+    except (BulletinError, AdjudicationError) as exc:
+        return JSONResponse(status_code=422, content={"ok": False, "error": str(exc)})
+    return JSONResponse(content={"ok": True, "result": result})
 
 
 app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="static")

@@ -13,6 +13,17 @@
 - 公告按编号与可选版本读取，缺省读最新，未知编号/版本返回 404；旧版本永久
   只读，后续编辑、清空与刷新都不影响已发布的公告；
 - 公告编号、记录秒数与用时全程按任意精度整数/原样字符串处理，不发生截断。
+
+版本链迁移（导出 / 导入）：
+- 导出：把所选编号的完整版本链打成格式版本 1 的 JSON 归档（每版含编号、版本、
+  发布时间与完整快照）；整包在同一事务中读取，取自同一数据库时点；任一编号
+  未知整次 404，不出部分归档；
+- 导入：不重新裁决、不改动发布校验，只核对归档结构；每个编号的版本须从 1 起
+  连续且无重复，快照结构与原读取结果一致；重叠版本的快照及发布时间须相同
+  （对象键序忽略，数组顺序与 JSON 类型保留），相同项跳过、只追加本地缺失的
+  后缀版本，本地链更长则保留本地；任一编号分叉整次 409、格式非法整次 422，
+  两者都不写入任何编号；核对与写入在同一事务中按提交时库内状态进行，无论
+  提交顺序都不覆盖旧版、不留断链或半批。
 """
 
 from __future__ import annotations
@@ -40,6 +51,10 @@ MAX_PENALTY_REASON = 200
 
 REVIEW_STATUSES = ("pending", "pass", "doubt")
 
+# 版本链迁移归档的格式版本与快照结构（与原读取结果的快照部分一致）。
+ARCHIVE_FORMAT = 1
+SNAPSHOT_KEYS = ("input", "adjudication", "reviews", "penalties", "ranking")
+
 
 class BulletinError(ValueError):
     """公告请求非法，message 为可直接展示的中文说明（端点返回 422）。"""
@@ -51,6 +66,46 @@ class BulletinConflict(Exception):
     def __init__(self, current_version: int):
         super().__init__(f"公告版本已变化：当前最新版本为 {current_version}")
         self.current_version = current_version
+
+
+class BulletinNotFound(Exception):
+    """导出的所选编号在本地不存在：整次 404，不出部分归档。"""
+
+    def __init__(self, number: str):
+        super().__init__(f"公告不存在：{number}")
+        self.number = number
+
+
+class BulletinFork(Exception):
+    """归档与本地历史分叉：重叠版本的快照或发布时间不一致（端点返回 409）。"""
+
+    def __init__(self, number: str, version: int):
+        super().__init__(f"公告 {number} 的版本 {version} 与本地已发布内容不一致")
+        self.number = number
+        self.version = version
+
+
+def _json_equal(a: Any, b: Any) -> bool:
+    """按 JSON 语义深度比较：对象键序忽略，数组顺序保留，JSON 类型严格区分。
+
+    Python 的 == 会把 1 与 true、1 与 1.0 视为相等；这里按 JSON 类型区分：
+    布尔只等于布尔，数字（整数/小数）按数值比较，字符串、null 各自成类。
+    """
+    if isinstance(a, bool) or isinstance(b, bool):
+        return type(a) is type(b) and a == b
+    if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+        return a == b
+    if isinstance(a, str) or isinstance(b, str):
+        return isinstance(a, str) and isinstance(b, str) and a == b
+    if a is None or b is None:
+        return a is None and b is None
+    if isinstance(a, list) and isinstance(b, list):
+        return len(a) == len(b) and all(_json_equal(x, y) for x, y in zip(a, b))
+    if isinstance(a, dict) and isinstance(b, dict):
+        if a.keys() != b.keys():
+            return False
+        return all(_json_equal(a[key], b[key]) for key in a)
+    return False
 
 
 class BulletinStore:
@@ -153,6 +208,90 @@ class BulletinStore:
         payload = json.loads(row[1])
         # 编号与版本是表列，快照正文不含它们，读取时合并返回。
         return {"number": number, "version": row[0], "publishedAt": row[2], **payload}
+
+    def read_chains(self, numbers: list[str]) -> dict[str, list[tuple[int, str, str]]]:
+        """一次性读取多个编号的完整版本链：编号 -> [(版本, 快照文本, 发布时间), ...]。
+
+        全部读取在同一事务中完成：整包取自同一数据库时点，并发发布不会造成
+        半新半旧的混合归档。未知编号对应空列表（由调用方决定整次 404）。
+        """
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute("BEGIN")
+            try:
+                chains: dict[str, list[tuple[int, str, str]]] = {}
+                for number in numbers:
+                    rows = cur.execute(
+                        "SELECT version, payload, created_at FROM bulletins"
+                        " WHERE number = ? ORDER BY version",
+                        (number,),
+                    ).fetchall()
+                    chains[number] = [(row[0], row[1], row[2]) for row in rows]
+            except BaseException:
+                cur.execute("ROLLBACK")
+                raise
+            cur.execute("COMMIT")
+            return chains
+
+    def import_chains(self, entries: list[tuple[str, list[dict]]]) -> tuple[int, int]:
+        """把归档版本链并入本地：重叠版本逐项核对，相同跳过，只追加缺失后缀。
+
+        核对与写入在同一 BEGIN IMMEDIATE 事务中按提交时库内状态进行：任一编号
+        分叉（重叠版本的快照或发布时间不一致）都整体回滚——不写入任何编号，
+        也不覆盖本地已有版本；本地链更长时保留本地。无论与既有发布的提交顺序
+        如何，都不留断链或半批。多进程写同一库文件导致的主键冲突按最新已提交
+        状态重试。返回 (新增版本数, 跳过版本数)。
+        """
+        with self._lock:
+            last_error: sqlite3.IntegrityError | None = None
+            for _ in range(3):
+                cur = self._conn.cursor()
+                cur.execute("BEGIN IMMEDIATE")
+                try:
+                    added = 0
+                    skipped = 0
+                    for number, versions in entries:
+                        rows = cur.execute(
+                            "SELECT version, payload, created_at FROM bulletins"
+                            " WHERE number = ? ORDER BY version",
+                            (number,),
+                        ).fetchall()
+                        local = {row[0]: (row[1], row[2]) for row in rows}
+                        for entry in sorted(versions, key=lambda item: item["version"]):
+                            version = entry["version"]
+                            existing = local.get(version)
+                            if existing is None:
+                                cur.execute(
+                                    "INSERT INTO bulletins"
+                                    " (number, version, payload, created_at)"
+                                    " VALUES (?, ?, ?, ?)",
+                                    (
+                                        number,
+                                        version,
+                                        json.dumps(entry["snapshot"], ensure_ascii=False),
+                                        entry["publishedAt"],
+                                    ),
+                                )
+                                added += 1
+                                continue
+                            payload_text, created_at = existing
+                            if created_at != entry["publishedAt"] or not _json_equal(
+                                json.loads(payload_text), entry["snapshot"]
+                            ):
+                                raise BulletinFork(number, version)
+                            skipped += 1
+                except sqlite3.IntegrityError as exc:
+                    # 兜底：多进程写同一库文件时，另一进程可能刚提交了相同
+                    # (编号, 版本)；回滚后按最新已提交状态重试合并。
+                    cur.execute("ROLLBACK")
+                    last_error = exc
+                    continue
+                except BaseException:
+                    cur.execute("ROLLBACK")
+                    raise
+                cur.execute("COMMIT")
+                return added, skipped
+            raise last_error
 
 
 def _as_bulletin_error(exc: AdjudicationError) -> BulletinError:
@@ -418,3 +557,132 @@ def publish_bulletin(payload: Any, store: BulletinStore) -> dict:
         "version": version,
         "url": f"/api/bulletins/{quote(number, safe='')}?version={version}",
     }
+
+
+def _parse_export_numbers(payload: Any) -> list[str]:
+    """解析导出选择：非空编号数组；重复选择（去空白后相同）自动去重。"""
+    if not isinstance(payload, dict):
+        raise BulletinError("请求体格式不正确")
+    raw = payload.get("numbers")
+    if not isinstance(raw, list) or not raw:
+        raise BulletinError("请选择要导出的公告编号（numbers 为非空数组）")
+    numbers: list[str] = []
+    seen: set[str] = set()
+    for item in raw:
+        number = _parse_bulletin_number(item)
+        if number not in seen:
+            seen.add(number)
+            numbers.append(number)
+    return numbers
+
+
+def export_bulletins(payload: Any, store: BulletinStore) -> dict:
+    """导出所选编号的完整版本链，返回格式版本 1 的归档。
+
+    整包取自同一数据库时点（单事务读取）；任一编号未知抛 BulletinNotFound
+    （整次 404，不出部分归档）；选择非法抛 BulletinError（422）。
+    """
+    numbers = _parse_export_numbers(payload)
+    chains = store.read_chains(numbers)
+    for number in numbers:
+        if not chains[number]:
+            raise BulletinNotFound(number)
+    return {
+        "format": ARCHIVE_FORMAT,
+        "bulletins": [
+            {
+                "number": number,
+                "versions": [
+                    {
+                        "version": version,
+                        "publishedAt": published_at,
+                        "snapshot": json.loads(payload_text),
+                    }
+                    for version, payload_text, published_at in chains[number]
+                ],
+            }
+            for number in numbers
+        ],
+    }
+
+
+def _validate_snapshot(snapshot: Any, number: str, version: int) -> None:
+    """快照结构须与原读取结果一致：恰好包含 input/adjudication/reviews/
+    penalties/ranking 五个部分，且容器类型正确。不重新裁决、不改动发布校验。"""
+    label = f"公告 {number} 的版本 {version} 快照"
+    if not isinstance(snapshot, dict):
+        raise BulletinError(f"{label}格式不正确")
+    if set(snapshot.keys()) != set(SNAPSHOT_KEYS):
+        raise BulletinError(
+            f"{label}须恰好包含 input、adjudication、reviews、penalties、ranking"
+        )
+    if not isinstance(snapshot["input"], dict) or not isinstance(
+        snapshot["adjudication"], dict
+    ):
+        raise BulletinError(f"{label}的 input 与 adjudication 必须是对象")
+    for key in ("reviews", "penalties", "ranking"):
+        if not isinstance(snapshot[key], list):
+            raise BulletinError(f"{label}的 {key} 必须是数组")
+
+
+def _parse_archive_version(value: Any, number: str, index: int) -> dict:
+    if not isinstance(value, dict):
+        raise BulletinError(f"公告 {number} 的第 {index} 个版本格式不正确")
+    try:
+        version = _parse_positive_int(
+            value.get("version"), f"公告 {number} 的第 {index} 个版本的版本号"
+        )
+    except AdjudicationError as exc:
+        raise _as_bulletin_error(exc)
+    published_at = value.get("publishedAt")
+    if not isinstance(published_at, str) or published_at == "":
+        raise BulletinError(f"公告 {number} 的第 {index} 个版本缺少发布时间（publishedAt）")
+    snapshot = value.get("snapshot")
+    _validate_snapshot(snapshot, number, version)
+    return {"version": version, "publishedAt": published_at, "snapshot": snapshot}
+
+
+def _parse_archive(payload: Any) -> list[tuple[str, list[dict]]]:
+    """整包校验归档格式（非法抛 BulletinError，端点返回 422，不写入任何编号）。"""
+    if not isinstance(payload, dict):
+        raise BulletinError("归档格式不正确")
+    fmt = payload.get("format")
+    if isinstance(fmt, bool) or not isinstance(fmt, int) or fmt != ARCHIVE_FORMAT:
+        raise BulletinError(f"归档格式版本不支持：仅接受 format = {ARCHIVE_FORMAT}")
+    raw = payload.get("bulletins")
+    if not isinstance(raw, list) or not raw:
+        raise BulletinError("归档的公告列表（bulletins）必须是非空数组")
+    entries: list[tuple[str, list[dict]]] = []
+    seen: set[str] = set()
+    for i, item in enumerate(raw, 1):
+        if not isinstance(item, dict):
+            raise BulletinError(f"归档第 {i} 条公告格式不正确")
+        number = _parse_bulletin_number(item.get("number"))
+        if number in seen:
+            raise BulletinError(f"归档中公告编号 {number} 重复")
+        seen.add(number)
+        raw_versions = item.get("versions")
+        if not isinstance(raw_versions, list) or not raw_versions:
+            raise BulletinError(f"公告 {number} 的版本列表（versions）必须是非空数组")
+        versions = [
+            _parse_archive_version(v, number, j) for j, v in enumerate(raw_versions, 1)
+        ]
+        version_numbers = [v["version"] for v in versions]
+        if len(set(version_numbers)) != len(version_numbers):
+            raise BulletinError(f"公告 {number} 的版本号重复")
+        if set(version_numbers) != set(range(1, len(versions) + 1)):
+            raise BulletinError(f"公告 {number} 的版本必须从 1 起连续")
+        entries.append((number, versions))
+    return entries
+
+
+def import_bulletins(payload: Any, store: BulletinStore) -> dict:
+    """导入格式版本 1 的归档：先整包校验（422），再按提交时库内状态合并。
+
+    不重新裁决、不改动发布校验：只核对快照结构。任一编号分叉抛 BulletinFork
+    （409），格式非法抛 BulletinError（422）——两者都不写入任何编号。成功
+    返回 {"added": 新增版本数, "skipped": 跳过版本数}。
+    """
+    entries = _parse_archive(payload)
+    added, skipped = store.import_chains(entries)
+    return {"added": added, "skipped": skipped}
