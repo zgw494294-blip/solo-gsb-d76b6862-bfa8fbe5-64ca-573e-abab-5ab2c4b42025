@@ -1,6 +1,6 @@
 # 本地赛道计次裁决台
 
-一个完全本地运行的赛道计次（lap counting）裁决工具：录入 1～3 名选手、两段合格耗时区间与至多 40 条感应记录，自动为每名选手选出最优的完整计次方案；并可把**设备导出的感应日志（UTF-8 CSV）经 HTTP 预览后并入当前记录表**；还可在结果区对未采纳记录发起 HTTP“替代性诊断”，逐条判定同优可替代 / 仅次优可用 / 无法成趟；另提供**“查找漏读”**：推测只补一条读数就能多完成一趟的时间窗。对暂时存疑的感应记录，可在页面每行**隔离/重新纳入**，原始读数保留在表中、计算只用未隔离记录（裁决、诊断、漏读均支持可选 `excludedIds`）。复核全部“通过”后，可把当前裁决**发布为独立的只读成绩公告**：服务端重新裁决并核对复核与罚秒、按原规则生成名次，按编号版本化保存进 SQLite（Compose 数据卷跨重启保留），经 HTTP 按编号与可选版本读取。
+一个完全本地运行的赛道计次（lap counting）裁决工具：录入 1～3 名选手、两段合格耗时区间与至多 40 条感应记录，自动为每名选手选出最优的完整计次方案；并可把**设备导出的感应日志（UTF-8 CSV）经 HTTP 预览后并入当前记录表**；还可在结果区对未采纳记录发起 HTTP“替代性诊断”，逐条判定同优可替代 / 仅次优可用 / 无法成趟；另提供**“查找漏读”**：推测只补一条读数就能多完成一趟的时间窗。对暂时存疑的感应记录，可在页面每行**隔离/重新纳入**，原始读数保留在表中、计算只用未隔离记录（裁决、诊断、漏读均支持可选 `excludedIds`）。复核全部“通过”后，可把当前裁决**发布为独立的只读成绩公告**：服务端重新裁决并核对复核与罚秒、按原规则生成名次，按编号版本化保存进 SQLite（Compose 数据卷跨重启保留），经 HTTP 按编号与可选版本读取。已发布公告的**完整版本链可经 HTTP 导出为 JSON 归档并导入另一实例**完成迁移——不重新裁决、不覆盖当地历史（详见“公告迁移”节）。
 
 - 后端：Python + FastAPI（`app/`），成绩公告用 SQLite 持久化（`app/bulletin.py`）
 - 前端：原生 HTML / CSS / JavaScript，无构建步骤（`static/`）
@@ -70,6 +70,58 @@
 - **精确性**：公告编号按原样文本保存（任意长的数字串不截断），记录秒数与用时按任意精度整数处理。
 
 公告卡独立于裁决生命周期：不随输入变化清除，也不要求当前存在合法结果——所有校验都在服务端按快照独立完成。
+
+## 公告迁移（双实例导出 / 导入，不重新裁决）
+
+已发布公告的**完整版本链**可经 HTTP 从一台实例迁往另一台实例：导出端把所选编号打成**格式版本 1** 的 JSON 归档（含每版编号、版本、发布时间与完整快照，**整包取自同一数据库时点**），导入端校验后**只追加本地缺失的后缀版本**——**不重新裁决、不覆盖当地历史**。迁移后目标实例的原读取接口照常读最新与旧版，后续发布从最新版本继续；编号、秒数与用时全程精确，发布校验与编辑区不受影响。
+
+### 双实例迁移示例
+
+同一镜像起两个容器（各自独立数据卷，源 8000 / 目标 8001）：
+
+```bash
+docker build -t lap-judge .
+docker run -d --name judge-src -p 8000:8000 -v bulletin-src:/data \
+  -e BULLETIN_DB_PATH=/data/bulletins.db lap-judge
+docker run -d --name judge-dst -p 8001:8000 -v bulletin-dst:/data \
+  -e BULLETIN_DB_PATH=/data/bulletins.db lap-judge
+```
+
+从源实例导出所选编号，并导入目标实例：
+
+```bash
+# 1. 从源实例导出（响应的 result 即归档文件）
+curl -s -X POST http://localhost:8000/api/bulletins/export \
+  -H 'Content-Type: application/json' \
+  -d '{"numbers": ["2026-001", "2026-002"]}' \
+  | python3 -c 'import json,sys; json.dump(json.load(sys.stdin)["result"], sys.stdout, ensure_ascii=False)' \
+  > archive.json
+
+# 2. 导入目标实例（可重复执行：相同版本跳过，只追加缺失后缀）
+curl -s -X POST http://localhost:8001/api/bulletins/import \
+  -H 'Content-Type: application/json' \
+  -d @archive.json
+# => {"ok":true,"result":{"added":3,"skipped":0}}
+```
+
+源实例后续又发布新版本后，重新导出并再次导入即可增量追上（已迁入版本全部跳过，`added` 只计新追加的后缀）；目标实例本地链更长时全部跳过、本地保留。
+
+### 冲突与非法调用示例
+
+```bash
+# 分叉：目标实例同一编号同一版本的快照或发布时间不同 → 409，整批不写入任何编号
+$ curl -s -X POST http://localhost:8001/api/bulletins/import -H 'Content-Type: application/json' -d @archive.json
+{"ok":false,"error":"公告 2026-001 的版本 2 与本地已发布内容分叉，本次未导入任何编号"}
+
+# 格式非法：格式版本不是 1、版本不从 1 起连续/重复、快照结构不符等 → 422，整批不写入
+{"ok":false,"error":"公告 2026-001 的版本必须从 1 起连续"}
+
+# 导出含未知编号 → 整次 404，不生成部分归档
+$ curl -s -X POST http://localhost:8000/api/bulletins/export -H 'Content-Type: application/json' -d '{"numbers":["2026-001","ghost"]}'
+{"ok":false,"error":"公告不存在：ghost"}
+```
+
+详细合同见“API”节的 `POST /api/bulletins/export` 与 `POST /api/bulletins/import`。
 
 ## 一键启动（Docker Compose）
 
@@ -551,6 +603,61 @@ curl -s 'http://localhost:8000/api/bulletins/2026-001?version=1'
 - 未知编号或版本：`404 {"ok": false, "error": "公告不存在"}`；版本号不是正整数：`400`；
 - 公告存于 SQLite（默认 `data/bulletins.db`，环境变量 `BULLETIN_DB_PATH` 可覆盖；Compose 部署为命名数据卷 `bulletin-data`），跨重启保留；旧版本永久只读，后续编辑、清空与刷新页面都不影响已发布的公告。
 
+### `POST /api/bulletins/export`（导出公告归档，格式版本 1，只读）
+
+请求体为要导出的公告编号列表（非空数组、不重复；编号规则同发布，JSON 整数按十进制文本接受）：
+
+```bash
+curl -s -X POST http://localhost:8000/api/bulletins/export \
+  -H 'Content-Type: application/json' \
+  -d '{"numbers": ["2026-001", "2026-002"]}'
+```
+
+```json
+{
+  "ok": true,
+  "result": {
+    "format": 1,
+    "bulletins": [
+      {
+        "number": "2026-001",
+        "version": 1,
+        "publishedAt": "2026-10-06T08:39:58.833582+00:00",
+        "snapshot": {
+          "input": {"standards": {}, "runners": [], "records": []},
+          "adjudication": {"runners": []},
+          "reviews": [],
+          "penalties": [],
+          "ranking": []
+        }
+      },
+      {"number": "2026-001", "version": 2, "publishedAt": "...", "snapshot": {}}
+    ]
+  }
+}
+```
+
+- 每个条目含**编号、版本、发布时间与完整快照**（快照即原读取结果中除编号/版本/发布时间外的五个部分）；条目按请求编号顺序、版本升序排列；
+- **整包取自同一数据库时点**：全部编号的版本链在同一事务中读取，不会拼出“半个新批次”；
+- **任一编号不存在 → 整次 `404 {"ok": false, "error": "公告不存在：编号"}`**，不生成部分归档；编号列表缺失/为空/重复/含非法编号 → `422`；请求体不是 JSON → `400`；
+- 归档可直接提交给另一实例的 `POST /api/bulletins/import`（取响应中的 `result` 作为请求体）。
+
+### `POST /api/bulletins/import`（导入公告归档，只追加缺失后缀）
+
+请求体即导出得到的归档对象（上例响应中的 `result`）：
+
+```bash
+curl -s -X POST http://localhost:8001/api/bulletins/import \
+  -H 'Content-Type: application/json' \
+  -d @archive.json
+```
+
+- **格式校验（违反 → `422`，不写入任何编号）**：`format` 必须为 `1`；`bulletins` 为版本条目数组（可为空）；每条**恰好**含 `number`/`version`/`publishedAt`/`snapshot` 四个字段；**每个编号的版本必须从 1 起连续、无重复**；快照结构须与原读取结果一致（恰好 `input`/`adjudication`/`reviews`/`penalties`/`ranking` 五部分）。导入**不重新裁决**，快照原样搬运；
+- **重叠版本须完全相同**：本地已存在的版本，其发布时间与快照须与归档一致——**对象键序忽略，数组顺序与 JSON 类型保留**（`1` 不等于 `"1"`、`true` 不等于 `1`，数组调序即不同）。相同项**跳过**，只**追加**本地缺失的后缀版本（发布时间按归档原样保存）；**本地链更长则全部跳过、本地保留**；
+- **任一编号分叉 → `409 {"ok": false, "error": "公告 … 与本地已发布内容分叉，本次未导入任何编号"}`**，不写入任何编号；成功 `200 {"ok": true, "result": {"added": 新增版本数, "skipped": 跳过版本数}}`；请求体不是 JSON → `400`；
+- **与既有发布按提交时库内状态协调**：重叠比对与追加在同一写事务中完成，无论与发布请求的提交顺序如何，都不会覆盖旧版、留下断链或写入半批；导入后原读取接口照常读最新与旧版，后续发布从最新版本继续；
+- 编号、记录秒数与用时全程按任意精度整数/原样字符串处理，迁移不发生截断。
+
 ## 测试
 
 ```bash
@@ -647,6 +754,14 @@ node test_bulletin_lifecycle.js
 
 覆盖：公告卡独立常驻（初始即显示、不随输入非法隐藏）、空编号客户端拦截不发请求、点击时快照提交完整输入（含 `excludedIds`）/复核（选手 + 三条记录 ID/门/秒数 + 状态备注）/罚秒且首次所见版本为 0、成功后显示公告链接并追踪所见版本（再次发布基于新版本）、409 采用服务端 `currentVersion` 后可再发布成功、422/断网只在公告卡报错、loading 期间按钮与输入禁用且重复点击/直接调用不再发请求、发布响应不改写编辑区/结果区/复核/罚秒、在途时输入变更迟到的成功只落在公告卡、存疑复核按原样提交、隔离记录随快照提交、超过 2^53 的公告编号/选手编号/记录秒数在快照与链接中全程精确。
 
+公告迁移（导出归档 / 导入追加）的端到端规则：
+
+```bash
+python3 test_bulletin_transfer.py
+```
+
+覆盖：导出格式版本 1（每版编号/版本/发布时间/完整快照、按请求编号顺序与版本升序、与读取结果一致）、未知编号整次 404、导出选择校验（空列表/重复/非法编号 422、坏 JSON 400、JSON 整数编号按文本接受）；导入只追加缺失后缀（相同项跳过、本地较长保留、迁入版本保留归档发布时间、重复导入幂等、条目顺序无关）、重叠版本一致性（对象键序忽略——重排所有键仍相同；数组顺序与 JSON 类型保留——reviews 调序、数字改字符串/布尔、发布时间改动均判分叉）、分叉 409 与格式非法 422 均整批不写（含多编号原子性：可追加的编号也不写入）、版本链从 1 起连续与无重复校验、快照结构与原读取结果一致校验、双实例迁移（A 导出 → B 导入 → B 从最新版继续发布 → 回迁 A 只追加新版）、导入与并发发布按提交时库内状态协调（恰好一项成功、不覆盖旧版、不留断链或半批）、并发发布期间导出始终是连续完整链、超过 2^53 的大编号/大秒数迁移全程精确，以及原裁决/发布/读取合同不变。
+
 ## 目录结构
 
 ```
@@ -659,10 +774,11 @@ node test_bulletin_lifecycle.js
 │   ├── __init__.py
 │   ├── adjudication.py   # 输入校验 + 裁决 DP + 替代性诊断 DP + 查找漏读区间算法
 │   ├── merge.py          # 设备日志 CSV 解析与合并预览（去重/冲突/整批拒绝）
-│   ├── bulletin.py       # 成绩公告：发布核对（重新裁决/复核/罚秒/名次）+ SQLite 版本化存储
+│   ├── bulletin.py       # 成绩公告：发布核对 + SQLite 版本化存储 + 导出/导入迁移
 │   └── main.py           # FastAPI 入口：/api/adjudicate、/api/diagnose、/api/missing、
 │                         #   /api/import/preview、/api/import/confirm、
-│                         #   /api/bulletins/publish、/api/bulletins/{number} 与静态资源
+│                         #   /api/bulletins/publish、/api/bulletins/export、
+│                         #   /api/bulletins/import、/api/bulletins/{number} 与静态资源
 ├── static/
 │   ├── index.html
 │   ├── styles.css
@@ -672,6 +788,7 @@ node test_bulletin_lifecycle.js
 ├── test_missing.py             # 查找漏读算法与端点测试（含逐秒暴力对拍）
 ├── test_exclusion.py           # 可疑记录隔离（excludedIds）算法与端点测试
 ├── test_bulletin.py            # 成绩公告发布/核对/版本控制/读取测试
+├── test_bulletin_transfer.py   # 公告迁移：导出归档/导入追加/双实例协调测试
 ├── test_review_lifecycle.js    # 前端复核失效时序测试
 ├── test_ranking_lifecycle.js   # 前端名次表与罚秒测试
 ├── test_diagnose_lifecycle.js  # 前端替代性诊断生命周期测试
